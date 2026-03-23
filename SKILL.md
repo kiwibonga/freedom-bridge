@@ -337,10 +337,10 @@ xdotool search --name "Unity - projectname" windowactivate --sync
 Windows:
 
 ```
-powershell -Command "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::AppActivate('Unity - projectname')"
+powershell -Command "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::AppActivate('projectname - ')"
 ```
 
-MacOS:
+MacOS (untested):
 
 ```
 osascript -e 'tell application "Unity - projectname" to activate'
