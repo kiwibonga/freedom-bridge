@@ -17,18 +17,18 @@ You may have to tab to the Unity window afterwards to trigger compilation.
 As long as script compilation succeeds, this plugin will run a lightweight HTTP server that can receive queries:
 
 /exec -- Uses Mono.Evaluator to compile and run a C# string
+
 /compile -- Creates a temporary script file to run a job (legacy method, causes multiple domain reloads)
+
 /coroutine -- Uses Mono.Evaluator to compile and run a coroutine or async function
+
 /pending -- Queries status of a pending compile or coroutine operation
+
 /refresh -- Causes the asset database/scripts to refresh even if the editor is not focused
+
 /logs -- Reads Unity console logs
 
 This server will restart every time script compilation succeeds, and stay up if compilation fails. It will stop if you close Unity.
-
-## What it can do
-
-* Ask the agent anything: Start or stop play mode, load that scene in that folder I'm too lazy to open, run this menu item, find out the HP of that enemy next to the player, etc.
-* 
 
 ## Changelog
 
