@@ -6,7 +6,9 @@
 using System;
 using System.Collections.Concurrent;
 using System.IO;
+using System.Linq;
 using System.Net;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using UnityEditor;
@@ -23,9 +25,9 @@ namespace FreedomBridge
         private static HttpListener _listener;
         private static Thread _listenerThread;
         private static readonly ConcurrentQueue<Action> _mainThreadQueue = new ConcurrentQueue<Action>();
-        private static readonly ConcurrentQueue<string> _logBuffer = new ConcurrentQueue<string>();
-        private const int LOG_BUFFER_MAX = 200;
         private static volatile bool _running = false;
+        private static System.DateTime _lastDomainReloadTime = System.DateTime.Now;
+        private static int _errorCount = 0;
 
         // ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -43,6 +45,8 @@ namespace FreedomBridge
 
         private static void OnBeforeReload()
         {
+            _lastDomainReloadTime = System.DateTime.Now;
+            _errorCount = 0;
             StopServer();
             EditorApplication.update -= Tick;
             Application.logMessageReceived -= CaptureLog;
@@ -96,15 +100,11 @@ namespace FreedomBridge
 
         private static void CaptureLog(string message, string stackTrace, LogType type)
         {
-            var prefix = type == LogType.Error || type == LogType.Exception ? "[ERROR]"
-                       : type == LogType.Warning ? "[WARN]"
-                       : "[LOG]";
-            _logBuffer.Enqueue($"{prefix} {message}");
-            while (_logBuffer.Count > LOG_BUFFER_MAX)
-                _logBuffer.TryDequeue(out _);
+            if (type == LogType.Error || type == LogType.Exception)
+                _errorCount++;
         }
 
-        public static string[] GetRecentLogs() => _logBuffer.ToArray();
+        public static int GetErrorCount() => _errorCount;
 
         // ── HTTP Listener loop ────────────────────────────────────────────────────
 
@@ -127,8 +127,8 @@ namespace FreedomBridge
                 var req  = ctx.Request;
                 var path = req.Url.AbsolutePath.TrimEnd('/');
 
-                if (req.HttpMethod == "GET" && path == "/status")     { RespondJson(ctx, Status()); return; }
-                if (req.HttpMethod == "GET" && path == "/logs")       { RespondJson(ctx, Logs());   return; }
+                if (req.HttpMethod == "GET" && path == "/status")     { HandleStatus(ctx); return; }
+                if (req.HttpMethod == "GET" && path == "/logs")       { HandleLogs(ctx);   return; }
                 if (req.HttpMethod == "POST" && path == "/exec")      { HandleExec(ctx);    return; }
                 if (req.HttpMethod == "POST" && path == "/compile")   { HandleCompile(ctx); return; }
                 if (req.HttpMethod == "POST" && path == "/coroutine") { HandleCoroutine(ctx); return; }
@@ -141,6 +141,40 @@ namespace FreedomBridge
             {
                 try { RespondJson(ctx, Error(ex.ToString()), 500); } catch { }
             }
+        }
+
+        private static void HandleStatus(HttpListenerContext ctx)
+        {
+            string result = null;
+            var done = new ManualResetEventSlim(false);
+
+            RunOnMainThread(() =>
+            {
+                try { result = Status(); }
+                catch (Exception ex) { result = Error(ex.ToString()); }
+                finally { done.Set(); }
+            });
+
+            bool completed = done.Wait(TimeSpan.FromSeconds(5));
+            if (!completed) { RespondJson(ctx, Error("Status check timed out"), 504); return; }
+            RespondJson(ctx, result);
+        }
+
+        private static void HandleLogs(HttpListenerContext ctx)
+        {
+            string result = null;
+            var done = new ManualResetEventSlim(false);
+
+            RunOnMainThread(() =>
+            {
+                try { result = Logs(); }
+                catch (Exception ex) { result = Error(ex.ToString()); }
+                finally { done.Set(); }
+            });
+
+            bool completed = done.Wait(TimeSpan.FromSeconds(5));
+            if (!completed) { RespondJson(ctx, Error("Logs fetch timed out"), 504); return; }
+            RespondJson(ctx, result);
         }
 
         // ── Route handlers ────────────────────────────────────────────────────────
@@ -349,14 +383,88 @@ namespace FreedomBridge
 
         // ── Simple response helpers ───────────────────────────────────────────────
 
-        private static string Status() =>
-            $"{{\"status\":\"ok\",\"version\":\"1.0\",\"port\":{PORT}}}";
+        private static string Status()
+        {
+            bool isPlaying = false;
+            float playTime = 0f;
+            string projectName = "Unknown";
+            bool isImporting = false;
+            
+            try { isPlaying = Application.isPlaying; } catch { }
+            try { projectName = Application.productName; } catch { }
+            try { isImporting = EditorApplication.isUpdating; } catch { }
+            
+            if (isPlaying)
+            {
+                try { playTime = Time.realtimeSinceStartup; } catch { }
+            }
+
+            string lastReload = _lastDomainReloadTime.ToString("o");
+            int errorCount = GetErrorCount();
+
+            return $"{{\"status\":\"ok\",\"version\":\"1.0\",\"port\":{PORT}," +
+                   $"\"isPlaying\":{isPlaying.ToString().ToLower()}," +
+                   $"\"playTimeSeconds\":{playTime}," +
+                   $"\"projectName\":{JsonString(projectName)}," +
+                   $"\"lastDomainReload\":\"{lastReload}\"," +
+                   $"\"isImporting\":{isImporting.ToString().ToLower()}," +
+                   $"\"errorCount\":{errorCount}}}";
+        }
 
         private static string Logs()
         {
+            // Fetch fresh logs from Unity's console via the LogEntries API
+            var logs = new System.Collections.Generic.List<string>();
+            try
+            {
+                var logEntriesAssembly = System.AppDomain.CurrentDomain.GetAssemblies()
+                    .FirstOrDefault(a => a.GetName().Name == "UnityEditor.CoreModule");
+                
+                if (logEntriesAssembly != null)
+                {
+                    var logEntriesType = logEntriesAssembly.GetType("UnityEditor.LogEntries");
+                    if (logEntriesType != null)
+                    {
+                        var getCountMethod = logEntriesType.GetMethod("GetCount", BindingFlags.Static | BindingFlags.Public);
+                        var getEntryMethod = logEntriesType.GetMethod("GetEntryInternal", BindingFlags.Static | BindingFlags.Public);
+                        
+                        if (getCountMethod != null && getEntryMethod != null)
+                        {
+                            int count = (int)getCountMethod.Invoke(null, null);
+                            var logEntryType = logEntriesAssembly.GetType("UnityEditor.LogEntry");
+                            
+                            for (int i = 0; i < count; i++)
+                            {
+                                var logEntry = Activator.CreateInstance(logEntryType);
+                                getEntryMethod.Invoke(null, new object[] { i, logEntry });
+                                
+                                var conditionProperty = logEntryType.GetProperty("condition");
+                                var modeProperty = logEntryType.GetProperty("mode");
+                                
+                                if (conditionProperty != null && modeProperty != null)
+                                {
+                                    string condition = conditionProperty.GetValue(logEntry) as string;
+                                    int mode = (int)modeProperty.GetValue(logEntry);
+                                    
+                                    string prefix = mode == 2 ? "[ERROR]" : mode == 1 ? "[WARN]" : "[LOG]";
+                                    if (!string.IsNullOrEmpty(condition))
+                                    {
+                                        logs.Add($"{prefix} {condition}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[FreedomBridge] Failed to fetch fresh logs from LogEntries: {ex.Message}");
+            }
+
             var sb = new StringBuilder("{\"logs\":[");
             bool first = true;
-            foreach (var log in GetRecentLogs())
+            foreach (var log in logs)
             {
                 if (!first) sb.Append(",");
                 sb.Append(JsonString(log));
