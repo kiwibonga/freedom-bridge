@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -28,14 +29,18 @@ namespace FreedomBridge
         private static volatile bool _running = false;
         private static System.DateTime _lastDomainReloadTime = System.DateTime.Now;
         private static int _errorCount = 0;
+        private static readonly List<string> _compilationLogs = new List<string>();
+        private static readonly HashSet<string> _seenMessages = new HashSet<string>();
+        private static readonly object _logsLock = new object();
 
         // ── Lifecycle ────────────────────────────────────────────────────────────
 
-        static FreedomBridgeServer()
+     static FreedomBridgeServer()
         {
             EditorApplication.update += Tick;
             Application.logMessageReceived += CaptureLog;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeReload;
+            AssemblyReloadEvents.afterAssemblyReload += OnAfterReload;
 
             // Resume any pending compile-cycle job that survived the domain reload
             ScriptExecutor.ResumePendingJob();
@@ -46,10 +51,71 @@ namespace FreedomBridge
         private static void OnBeforeReload()
         {
             _lastDomainReloadTime = System.DateTime.Now;
-            _errorCount = 0;
+            // Don't clear logs here - capture errors that happen during compilation
             StopServer();
             EditorApplication.update -= Tick;
-            Application.logMessageReceived -= CaptureLog;
+            // Don't detach CaptureLog - we want to capture compile errors even during reload
+        }
+
+     private static void OnAfterReload()
+        {
+            // Re-attach Tick handler
+            EditorApplication.update += Tick;
+
+            // Start the server
+            StartServer();
+        }
+
+        // ── ScriptCompilation callbacks ───────────────────────────────────────────
+
+        private static void OnScriptCompilationStarted()
+        {
+            Debug.Log("[FreedomBridge] Script compilation started");
+            _errorCount = 0;
+            lock (_logsLock)
+            {
+                _compilationLogs.Clear();
+            }
+        }
+
+        // LSP doesn't know CompiledScript but this compiles at runtime
+        // Method signature must be: void(object[], bool, string) for the callback
+        private static void OnScriptCompilationCompleted(object scripts, bool successful, string logFile)
+        {
+            Debug.Log($"[FreedomBridge] Script compilation completed, successful={successful}, logFile={logFile}");
+            
+            if (!successful && !string.IsNullOrEmpty(logFile))
+            {
+                try
+                {
+                    if (System.IO.File.Exists(logFile))
+                    {
+                        var logContent = System.IO.File.ReadAllText(logFile);
+                        foreach (var line in logContent.Split('\n'))
+                        {
+                            var trimmed = line.Trim();
+                            if (!string.IsNullOrWhiteSpace(trimmed))
+                            {
+                                lock (_logsLock)
+                                {
+                                    _compilationLogs.Add(trimmed);
+                                }
+                                
+                                if (trimmed.Contains(("error CS")))
+                                {
+                                    _errorCount++;
+                                }
+                            }
+                        }
+                        
+                        Debug.Log($"[FreedomBridge] Loaded {_compilationLogs.Count} compilation log entries, {_errorCount} errors");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[FreedomBridge] Failed to read compilation log: {ex.Message}");
+                }
+            }
         }
 
         // ── Server start/stop ────────────────────────────────────────────────────
@@ -98,10 +164,49 @@ namespace FreedomBridge
 
         // ── Log capture ───────────────────────────────────────────────────────────
 
-        private static void CaptureLog(string message, string stackTrace, LogType type)
+           private static void CaptureLog(string message, string stackTrace, LogType type)
         {
-            if (type == LogType.Error || type == LogType.Exception)
-                _errorCount++;
+            // Create a formatted log entry
+            string prefix = type == LogType.Error || type == LogType.Exception ? "[ERROR]"
+                        : type == LogType.Warning ? "[WARN]"
+                        : "[LOG]";
+            string formatted = $"{prefix} {message}";
+            
+            // Use deduplication - only add if we haven't seen this exact message before
+            lock (_logsLock)
+            {
+                if (_seenMessages.Contains(formatted))
+                {
+                    return; // Already added this message
+                }
+                _seenMessages.Add(formatted);
+                
+                // Count errors
+                if (type == LogType.Error || type == LogType.Exception)
+                {
+                    _errorCount++;
+                }
+                
+                // Add to logs
+                _compilationLogs.Add(formatted);
+                
+                // Keep only the last 200 entries
+                while (_compilationLogs.Count > 200)
+                {
+                    _compilationLogs.RemoveAt(0);
+                }
+                
+                // Also remove old entries from seenMessages
+                if (_seenMessages.Count > 500)
+                {
+                    // Rebuild seenMessages from current logs
+                    _seenMessages.Clear();
+                    foreach (var log in _compilationLogs)
+                    {
+                        _seenMessages.Add(log);
+                    }
+                }
+            }
         }
 
         public static int GetErrorCount() => _errorCount;
@@ -281,6 +386,15 @@ namespace FreedomBridge
 
         private static void HandleRefresh(HttpListenerContext ctx)
         {
+            // Clear logs and error count before triggering refresh
+            // This ensures we only capture errors from this compilation cycle
+            _errorCount = 0;
+            lock (_logsLock)
+            {
+                _compilationLogs.Clear();
+                _seenMessages.Clear();
+            }
+
             // Force AssetDatabase refresh and wait for it to complete (best-effort)
             string error = null;
             var done = new ManualResetEventSlim(false);
@@ -413,53 +527,11 @@ namespace FreedomBridge
 
         private static string Logs()
         {
-            // Fetch fresh logs from Unity's console via the LogEntries API
+            // Return our captured logs (compile errors + runtime logs)
             var logs = new System.Collections.Generic.List<string>();
-            try
+            lock (_logsLock)
             {
-                var logEntriesAssembly = System.AppDomain.CurrentDomain.GetAssemblies()
-                    .FirstOrDefault(a => a.GetName().Name == "UnityEditor.CoreModule");
-                
-                if (logEntriesAssembly != null)
-                {
-                    var logEntriesType = logEntriesAssembly.GetType("UnityEditor.LogEntries");
-                    if (logEntriesType != null)
-                    {
-                        var getCountMethod = logEntriesType.GetMethod("GetCount", BindingFlags.Static | BindingFlags.Public);
-                        var getEntryMethod = logEntriesType.GetMethod("GetEntryInternal", BindingFlags.Static | BindingFlags.Public);
-                        
-                        if (getCountMethod != null && getEntryMethod != null)
-                        {
-                            int count = (int)getCountMethod.Invoke(null, null);
-                            var logEntryType = logEntriesAssembly.GetType("UnityEditor.LogEntry");
-                            
-                            for (int i = 0; i < count; i++)
-                            {
-                                var logEntry = Activator.CreateInstance(logEntryType);
-                                getEntryMethod.Invoke(null, new object[] { i, logEntry });
-                                
-                                var conditionProperty = logEntryType.GetProperty("condition");
-                                var modeProperty = logEntryType.GetProperty("mode");
-                                
-                                if (conditionProperty != null && modeProperty != null)
-                                {
-                                    string condition = conditionProperty.GetValue(logEntry) as string;
-                                    int mode = (int)modeProperty.GetValue(logEntry);
-                                    
-                                    string prefix = mode == 2 ? "[ERROR]" : mode == 1 ? "[WARN]" : "[LOG]";
-                                    if (!string.IsNullOrEmpty(condition))
-                                    {
-                                        logs.Add($"{prefix} {condition}");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[FreedomBridge] Failed to fetch fresh logs from LogEntries: {ex.Message}");
+                logs.AddRange(_compilationLogs);
             }
 
             var sb = new StringBuilder("{\"logs\":[");
